@@ -47,24 +47,19 @@ def _norm_name(s: str) -> str:
     return re.sub(r"[\s_\-]+", "", s.strip().lower())
 
 
-def _find_subject_folder() -> Optional[Path]:
-    """Auto-locate the subject folder on this machine.
+def find_folder(name: str) -> Optional[Path]:
+    """Locate ANY subject folder by name on this machine.
 
-    Candidate names in priority order: MCA_LABS_NAME env (only if explicitly
-    set), then "MCA_TEST", then "mca_labs". For each candidate we try an
-    exact name match first, then containment — OneDrive prefixes shared
-    folders with the sharer ("Manoj Suryawanshi's files - MCA-TEST").
-    Checks ~/OneDrive*, ~/Library/CloudStorage/OneDrive* (macOS), the home
-    dir and ~/Downloads. Returns None if nothing matches.
+    Matching is forgiving: case/space/underscore/hyphen-insensitive, so
+    "MCA_LABS", "mca labs" and "MCA-LABS" all work. Tries an exact name
+    match first, then containment — OneDrive prefixes shared folders with
+    the sharer ("Manoj Suryawanshi's files - MCA-TEST" matches "MCA-TEST").
+    Checks the home dir, ~/Library/CloudStorage/OneDrive* (macOS) and
+    ~/Downloads. Returns None if nothing matches.
     """
-    env_name = os.getenv("MCA_LABS_NAME")
-    wanted: List[str] = []
-    if env_name:
-        wanted.append(_norm_name(env_name))
-    for name in ("mca_test", "mca_labs"):
-        n = _norm_name(name)
-        if n not in wanted:
-            wanted.append(n)
+    want = _norm_name(name or "")
+    if not want:
+        return None
 
     home = Path.home()
     roots: List[Path] = [home, home / "Library" / "CloudStorage", home / "Downloads"]
@@ -98,20 +93,37 @@ def _find_subject_folder() -> Optional[Path]:
                 except OSError:
                     continue
 
-    for want in wanted:
-        # exact match first, then containment (prefixed shared-folder names)
-        try:
-            exact = [p for p in _iter_candidates() if _norm_name(p.name) == want]
-        except OSError:
-            exact = []
-        if exact:
-            return sorted(exact, key=lambda p: str(p))[0]
-        try:
-            loose = [p for p in _iter_candidates() if want in _norm_name(p.name)]
-        except OSError:
-            loose = []
-        if loose:
-            return sorted(loose, key=lambda p: str(p))[0]
+    candidates = list(_iter_candidates())
+    exact = [p for p in candidates if _norm_name(p.name) == want]
+    if exact:
+        return sorted(exact, key=lambda p: str(p))[0]
+    if len(want) < 3:
+        # containment on 1-2 char names would match everything
+        return None
+    loose = [p for p in candidates if want in _norm_name(p.name)]
+    if loose:
+        return sorted(loose, key=lambda p: str(p))[0]
+    return None
+
+
+def _find_subject_folder() -> Optional[Path]:
+    """Auto-locate the default subject folder (backward-compatible default
+    for runs that don't pass an explicit folder name).
+
+    Priority: MCA_LABS_NAME env (only if explicitly set), then "MCA_TEST",
+    then "mca_labs" — each resolved through find_folder().
+    """
+    names: List[str] = []
+    env_name = os.getenv("MCA_LABS_NAME")
+    if env_name:
+        names.append(env_name)
+    for name in ("mca_test", "mca_labs"):
+        if name not in names:
+            names.append(name)
+    for n in names:
+        found = find_folder(n)
+        if found is not None:
+            return found
     return None
 
 

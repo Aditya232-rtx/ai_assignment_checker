@@ -1,10 +1,13 @@
 # cli.py
 """Command‑line interface for the local AI Assignment Checker.
 Commands:
+  * ``map-marks`` – the professor command: scan a subject folder, AI-grade
+    submissions against a rubric, join attendance, write/update
+    marks_output.xlsx + marks_output.txt inside that folder.
   * ``watch`` – continuously poll the OneDrive sync folder for new files.
   * ``grade-all`` – batch‐process every file marked as ``new`` in SQLite.
   * ``eval`` – compare the generated CSV against a gold‑standard CSV (optional).
-All commands accept ``--rubric <path>`` to load the grading rubric.
+The professor flow only needs: ``python -m checker.cli map-marks <FOLDER> --rubric <path>``.
 """
 import argparse
 import json
@@ -14,7 +17,7 @@ import os
 from pathlib import Path
 
 # Absolute imports – this script is executed directly, so we need the full package path.
-from checker.config import ONEDRIVE_SYNC_PATH, DRY_RUN, RETAIN_RAW, OUTPUT_CSV_PATH
+from checker.config import ONEDRIVE_SYNC_PATH, DRY_RUN, RETAIN_RAW, OUTPUT_CSV_PATH, MODEL_NAME, find_folder
 from checker.local_ingestor import discover_new_submissions, list_pending_files
 from checker.parser import parse_file
 from checker.prechecks import run_prechecks, compute_hash, similarity_fingerprint
@@ -131,17 +134,20 @@ def main() -> None:
     p_eval.add_argument("--generated", default=str(OUTPUT_CSV_PATH), help="Path to generated CSV (defaults to config)")
 
     # map-marks command – rollno x Assign1..11 Excel joined with attendance.
-    # Professor flow: everything lives in <OneDrive>/mca_labs (auto-found).
-    # Attendance and output default into that same folder, so sir only
-    # manages files — one command does the rest. Re-runs pick up new files.
+    # Professor flow: pass the SUBJECT FOLDER NAME (MCA_LABS, PYTHON_ASSIGNMENTS,
+    # MCA-TEST, ...) or an absolute path. Attendance and the two output files
+    # live inside that folder. Re-runs UPDATE the same marks_output.xlsx /
+    # marks_output.txt in place: unchanged submissions are reused from the
+    # hidden cache sheet, only new/changed files are AI-graded.
     p_map = subparsers.add_parser("map-marks", help="Build rollno x assignment marks Excel from attendance + scanned submissions")
+    p_map.add_argument("folder", nargs="?", default=None, help="Subject folder NAME (e.g. MCA_LABS, PYTHON_ASSIGNMENTS) or absolute path; auto-discovered if omitted")
     p_map.add_argument("--attendance", type=Path, default=None, help="Path to attendance.xlsx (default: *attendance*.xlsx inside the subject folder)")
-    p_map.add_argument("--output", type=Path, default=None, help="Output Excel path (default: marks sheet inside the subject folder)")
+    p_map.add_argument("--output", type=Path, default=None, help="Output Excel path (default: marks_output.xlsx inside the subject folder — same file updated every run)")
     p_map.add_argument("--assignments", type=int, default=11, help="Number of assignments/labs")
     p_map.add_argument("--no-grade", action="store_true", help="Skip LLM grading: Present+submitted=10, Absent+submitted=5")
     p_map.add_argument("--rubric", type=Path, default=None, help="Rubric YAML (needed unless --no-grade)")
     p_map.add_argument("--subject", default=None, help="Only grade files with this in the filename (e.g. mca)")
-    p_map.add_argument("--sync-path", type=Path, default=None, help="Override the auto-detected subject folder for this run")
+    p_map.add_argument("--sync-path", type=Path, default=None, help="Explicit folder path (alternative to the positional folder arg)")
     p_map.add_argument("--interval", type=int, default=0, help="If >0, re-run every N seconds (auto mode) instead of once")
 
     args = parser.parse_args()
@@ -151,35 +157,56 @@ def main() -> None:
     elif args.command == "watch":
         watch_loop(args.rubric, poll_interval=args.interval)
     elif args.command == "map-marks":
-        from checker.marks_mapper import build_marks, ai_score_fn_factory, default_score_fn, find_attendance
+        from checker.marks_mapper import (
+            build_marks, ai_score_fn_factory, default_score_fn,
+            find_attendance, rubric_signature,
+        )
+
+        # --- resolve the subject folder: explicit path > folder NAME > auto-discovery
+        if args.folder:
+            as_path = Path(args.folder).expanduser()
+            if as_path.is_dir():
+                sync_path = as_path
+            else:
+                sync_path = find_folder(args.folder)
+                if sync_path is None:
+                    parser.error(
+                        f"Folder '{args.folder}' not found under OneDrive/home/Downloads. "
+                        f"Pass the folder name as-is (e.g. MCA_LABS) or an absolute path."
+                    )
+        elif args.sync_path:
+            sync_path = Path(args.sync_path)
+        else:
+            sync_path = ONEDRIVE_SYNC_PATH
+
         if args.no_grade:
             score_fn = default_score_fn
+            grade_meta = "nograde"
         else:
             if not args.rubric:
                 parser.error("map-marks without --no-grade requires --rubric <path>")
-            score_fn = ai_score_fn_factory(load_rubric(args.rubric))
-        sync_path = Path(args.sync_path) if args.sync_path else ONEDRIVE_SYNC_PATH
+            rubric = load_rubric(args.rubric)
+            score_fn = ai_score_fn_factory(rubric)
+            # cache meta: changing the rubric or model invalidates cached grades
+            grade_meta = f"model={MODEL_NAME}|rubric={rubric_signature(rubric)}"
+
         attendance = Path(args.attendance) if args.attendance else find_attendance(sync_path)
         if attendance is None:
             parser.error(f"No *attendance*.xlsx found in {sync_path} — pass --attendance <path>")
-        if args.output:
-            output = Path(args.output)
-        elif args.subject:
-            output = sync_path / f"marks_{args.subject.lower()}_output.xlsx"
-        else:
-            output = sync_path / "marks_output.xlsx"
+        # one stable output pair per folder, updated in place on every run
+        output = Path(args.output) if args.output else sync_path / "marks_output.xlsx"
         print(f"[MAP] folder={sync_path} attendance={attendance.name} -> {output.name}")
         if args.interval and args.interval > 0:
             print(f"[AUTO] Re-running every {args.interval}s. Ctrl+C to stop.")
             while True:
                 build_marks(attendance, sync_path, output,
                             n_assignments=args.assignments, score_fn=score_fn,
-                            subject=args.subject)
+                            subject=args.subject, grade_meta=grade_meta)
                 time.sleep(args.interval)
         else:
             build_marks(attendance, sync_path, output,
                         n_assignments=args.assignments, score_fn=score_fn,
-                        subject=args.subject)
+                        subject=args.subject, grade_meta=grade_meta)
     elif args.command == "eval":
         # Simple diff: count rows that differ.
         import csv

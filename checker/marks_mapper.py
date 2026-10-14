@@ -170,18 +170,33 @@ def read_submission_text(path: Path) -> str:
 
 
 def scan_submissions(
-    sync_path: Path, n_assignments: int = 11, subject: Optional[str] = None
+    sync_path: Path,
+    n_assignments: int = 11,
+    subject: Optional[str] = None,
+    exclude: Optional[List[Path]] = None,
 ) -> Tuple[Dict[Tuple[str, int], Path], List[str]]:
     """Walk sync_path -> {(rollno, assign_no): file_path}, plus unmapped filenames.
     If subject is given, only files with it in the filename (case-insensitive)
     are considered — e.g. subject='mca' picks up MCA_EXP-2.docx, Mca_lab3_AJ_14.docx.
-    """
+    `exclude` = our own output files (marks_output.txt contains rollnos and
+    would otherwise be graded as a submission of its own)."""
+    exclude_resolved = set()
+    for p in exclude or []:
+        try:
+            exclude_resolved.add(Path(p).resolve())
+        except OSError:
+            exclude_resolved.add(Path(p))
     found: Dict[Tuple[str, int], Path] = {}
     unmapped: List[str] = []
     dupes: List[str] = []
     skipped = 0
     for fp in sorted(sync_path.rglob("*")):
         if not fp.is_file() or fp.suffix.lower() not in ALLOWED_EXTENSIONS:
+            continue
+        try:
+            if fp.resolve() in exclude_resolved:
+                continue
+        except OSError:
             continue
         if subject and subject.lower() not in fp.name.lower():
             skipped += 1
@@ -305,6 +320,73 @@ def load_attendance(attendance_xlsx: Path, n_assignments: int = 11):
     return order, att
 
 
+# Hidden worksheet inside marks_output.xlsx that stores per-cell AI grades
+# from previous runs. Keyed on file sha256 + grading meta so a re-run only
+# re-grades NEW or CHANGED submissions — and the same two output files
+# (marks_output.xlsx / marks_output.txt) are updated in place every time.
+CACHE_SHEET = "AI_Grades"
+
+
+def _file_sha256(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def rubric_signature(rubric: dict) -> str:
+    """Short fingerprint of the rubric criteria — part of the cache meta so
+    editing the rubric triggers re-grading instead of reusing stale scores."""
+    import hashlib
+    import json
+
+    blob = json.dumps(rubric.get("criteria", []), sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def load_grade_cache(output_xlsx: Path) -> Dict[Tuple[str, int], Dict[str, str]]:
+    """Read previously computed raw AI grades from the hidden AI_Grades sheet
+    of the existing output workbook. Missing/locked/unreadable workbook ->
+    empty cache (safe fallback: everything gets re-graded)."""
+    import pandas as pd
+
+    if not output_xlsx.is_file():
+        return {}
+    try:
+        df = pd.read_excel(output_xlsx, sheet_name=CACHE_SHEET, dtype=str)
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        # workbook exists but has no AI_Grades sheet yet (first run / old file)
+        return {}
+    except Exception as e:
+        print(f"[CACHE] previous grades not readable ({type(e).__name__}); re-grading all")
+        return {}
+    cache: Dict[Tuple[str, int], Dict[str, str]] = {}
+    for _, r in df.iterrows():
+        try:
+            roll = str(r.get("rollno", "")).strip().lower()
+            if not roll or roll in ("nan", "none", ""):
+                continue
+            key = (str(r["rollno"]).strip(), int(float(str(r["assign"]))))
+            cache[key] = {
+                "raw": str(r.get("raw_score", "")),
+                "why": str(r.get("reasoning", "")),
+                "sha256": str(r.get("sha256", "")),
+                "meta": str(r.get("meta", "")),
+                "file": str(r.get("file", "")),
+            }
+        except Exception:
+            continue
+    return cache
+
+
 def default_score_fn(_path: Path, _text: str, _assign_no: int) -> Tuple[float, str]:
     """No-LLM scoring: full 10 (attendance rule caps absent to 5 later)."""
     return 10.0, "Deterministic mode (--no-grade): submitted work counted as 10/10 before the attendance rule."
@@ -351,17 +433,34 @@ def build_marks(
     score_fn: Optional[Callable[..., Any]] = None,
     subject: Optional[str] = None,
     write_reasoning: bool = True,
+    grade_meta: Optional[str] = None,
 ):
     """Full mapper: scan -> join -> apply 10/5/0 rule -> write Excel (+ a
-    .txt reasoning report next to it). Returns the marks DataFrame."""
+    .txt reasoning report next to it). Returns the marks DataFrame.
+
+    Incremental: previously graded cells (same file sha256 + same grade_meta)
+    are read back from the hidden AI_Grades sheet and reused — only new or
+    changed submissions hit the AI. Both output files are overwritten in
+    place; no new files are created on re-runs."""
     import pandas as pd
     from datetime import datetime
 
     from .config import MODEL_NAME
 
     score_fn = score_fn or default_score_fn
+    if grade_meta is None:
+        grade_meta = "nograde" if score_fn is default_score_fn else f"model={MODEL_NAME}"
+    cache = load_grade_cache(output_xlsx)
+    reused = 0
+    graded = 0
+    ai_rows: List[Dict[str, Any]] = []  # full cache sheet contents (old + new)
     order, att = load_attendance(attendance_xlsx, n_assignments)
-    submissions, unmapped = scan_submissions(sync_path, n_assignments, subject)
+    submissions, unmapped = scan_submissions(
+        sync_path,
+        n_assignments,
+        subject,
+        exclude=[output_xlsx, output_xlsx.with_suffix(".txt")],
+    )
 
     print(f"[SCAN] {len(submissions)} mapped submissions, {len(unmapped)} unmapped")
     for u in unmapped:
@@ -388,15 +487,39 @@ def build_marks(
                 missing_labs.append(lab)
                 continue
             present = att[roll].get(lab, "P") == "P"
-            text = read_submission_text(submissions[key])
-            res = score_fn(submissions[key], text, lab)
-            if isinstance(res, tuple):
-                raw10, why = float(res[0]), str(res[1])
+            fp = submissions[key]
+            sha = _file_sha256(fp)
+            cached = cache.get(key) if sha else None
+            if cached and cached["sha256"] == sha and cached["meta"] == grade_meta:
+                # unchanged file + same rubric/model -> reuse, skip AI call
+                raw10 = max(0.0, min(10.0, float(cached["raw"])))
+                why = cached["why"]
+                display_why = f"{why} [reused from previous run: file unchanged]"
+                reused += 1
             else:
-                raw10, why = float(res), "No reasoning returned by scorer."
-            raw10 = max(0.0, min(10.0, raw10))
+                text = read_submission_text(fp)
+                res = score_fn(fp, text, lab)
+                if isinstance(res, tuple):
+                    raw10, why = float(res[0]), str(res[1])
+                else:
+                    raw10, why = float(res), "No reasoning returned by scorer."
+                raw10 = max(0.0, min(10.0, raw10))
+                display_why = why
+                graded += 1
             final = raw10 if present else min(raw10, 5.0)
             row[f"Assign{lab}"] = final
+            ai_rows.append(
+                {
+                    "rollno": roll,
+                    "assign": lab,
+                    "raw_score": raw10,
+                    "reasoning": why[:32000],
+                    "file": fp.name,
+                    "sha256": sha,
+                    "meta": grade_meta,
+                    "graded_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
 
             if present:
                 rule = f"Present + submitted -> mark = AI raw score = {final:.2f}/10"
@@ -412,9 +535,9 @@ def build_marks(
                 )
             entries.append(
                 f"[{roll} | Expt {lab}]\n"
-                f"  File:       {submissions[key].name}\n"
+                f"  File:       {fp.name}\n"
                 f"  Attendance: {'Present' if present else 'Absent'}\n"
-                f"  Grading:    {why}\n"
+                f"  Grading:    {display_why}\n"
                 f"  Rule:       {rule}\n"
                 f"  FINAL MARK: {final:.2f} / 10\n"
             )
@@ -435,16 +558,31 @@ def build_marks(
         widths = [14] + [9] * n_assignments + [10]
         for i, wd in enumerate(widths, start=1):
             ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = wd
+        # hidden cache sheet: raw AI grades for incremental re-runs
+        cache_df = pd.DataFrame(
+            ai_rows,
+            columns=[
+                "rollno", "assign", "raw_score", "reasoning",
+                "file", "sha256", "meta", "graded_at",
+            ],
+        )
+        cache_df.to_excel(w, index=False, sheet_name=CACHE_SHEET)
+        w.sheets[CACHE_SHEET].sheet_state = "hidden"
 
     if write_reasoning:
         report_path = output_xlsx.with_suffix(".txt")
         lines = [
-            "MCA LABS — MARKS REASONING REPORT",
+            "MARKS REASONING REPORT",
             "=" * 60,
             f"Generated:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Folder:     {sync_path}",
             f"Attendance: {attendance_xlsx.name}  (P/2 = present, A/0 = absent)",
             f"Grader:     AI rubric grading via Ollama ({MODEL_NAME})",
+            f"Run stats:  {reused} cells reused from previous runs (file unchanged), "
+            f"{graded} newly graded",
+            "",
+            "NOTE: this report and marks_output.xlsx are updated IN PLACE on every",
+            "run — new/changed submissions are picked up, unchanged ones are reused.",
             "",
             "MARKING RULE:",
             "  * Not submitted                 -> 0/10",
@@ -481,6 +619,6 @@ def build_marks(
     )
     print(
         f"[DONE] {output_xlsx} : {len(df)} students x {n_assignments} assigns, "
-        f"{submitted_cells} non-zero cells"
+        f"{submitted_cells} non-zero cells | [CACHE] reused {reused}, newly graded {graded}"
     )
     return df
