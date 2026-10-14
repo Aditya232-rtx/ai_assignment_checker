@@ -1,0 +1,14 @@
+# requirements.txt
+pyyaml
+httpx
+msal
+jsonschema
+python-dotenv
+# optional parsers (install if you need PDF/DOCX support)
+# docx2txt
+# poppler-utils (provides pdftotext) – install via your OS package manager
+# marks mapper (Excel attendance + output)
+pandas
+openpyxl
+python-docx
+pymupdf

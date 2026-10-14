@@ -1,0 +1,24 @@
+# secrets — never commit
+.env
+**/.env
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# test / tool caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# runtime data & outputs (attendance, student submissions, marks, DB)
+data/
+*.db
+
+# stray nested duplicate (holds a .env)
+ai-assignment-checker-local/
+
+# OS noise
+.DS_Store

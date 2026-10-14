@@ -1,0 +1,7 @@
+criteria:
+  - name: Clarity
+    max: 5
+    description: How clearly the student expresses ideas.
+  - name: Correctness
+    max: 10
+    description: Accuracy of the solution.
