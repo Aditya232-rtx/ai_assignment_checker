@@ -133,6 +133,12 @@ def main() -> None:
     p_eval.add_argument("--gold", required=True, type=Path, help="Path to gold‑standard CSV")
     p_eval.add_argument("--generated", default=str(OUTPUT_CSV_PATH), help="Path to generated CSV (defaults to config)")
 
+    # serve command – local browser frontend over the same mapper pipeline.
+    p_serve = subparsers.add_parser("serve", help="Start the local browser frontend")
+    p_serve.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    p_serve.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
+    p_serve.add_argument("--open", action="store_true", help="Open the frontend in your default browser")
+
     # map-marks command – rollno x Assign1..11 Excel joined with attendance.
     # Professor flow: pass the SUBJECT FOLDER NAME (MCA_LABS, PYTHON_ASSIGNMENTS,
     # MCA-TEST, ...) or an absolute path. Attendance and the two output files
@@ -152,7 +158,10 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command == "grade-all":
+    if args.command == "serve":
+        from checker.web import run_server
+        run_server(host=args.host, port=args.port, open_browser=args.open)
+    elif args.command == "grade-all":
         _process_pending(args.rubric)
     elif args.command == "watch":
         watch_loop(args.rubric, poll_interval=args.interval)

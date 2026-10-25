@@ -73,6 +73,31 @@ python -m checker.cli map-marks PYTHON_ASSIGNMENTS --rubric rubrics/example_rubr
 python -m checker.cli map-marks MCA-TEST           --rubric rubrics/example_rubric.yaml
 ```
 
+### Browser frontend
+
+For a simple local control panel, run this from the project root:
+
+```bash
+python3 -m checker.cli serve --open
+```
+
+It prints the frontend URL (normally `http://127.0.0.1:8765`) and opens it in
+your default browser. The panel uses the same `map-marks` pipeline: inspect a
+folder, choose deterministic or AI grading, run the marksheet, and open the
+reasoning report. Stop the server with `Ctrl+C`.
+
+If `python3` is not on your PATH but the virtual environment is active, use
+`python -m checker.cli serve --open` instead.
+
+The easiest repeatable startup command is:
+
+```bash
+bash start.sh
+```
+
+It creates `.venv` when needed, installs the requirements into that project
+environment, and starts the browser frontend.
+
 - **Name matching is forgiving** — case, spaces, underscores and hyphens are
   equivalent: `MCA_LABS` = `mca labs` = `MCA-LABS`.
 - **Shared folders work** — OneDrive prefixes shared folders with the sharer
